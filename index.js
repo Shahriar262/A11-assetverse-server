@@ -45,19 +45,22 @@ const client = new MongoClient(process.env.MONGODB_URI, {
     strict: true,
     deprecationErrors: true,
   },
-})
+});
 async function run() {
   try {
+    const db = client.db("assetsDB");
+    const assetsCollection = db.collection("assets");
+
     // Send a ping to confirm a successful connection
-    await client.db('admin').command({ ping: 1 })
+    await client.db("admin").command({ ping: 1 });
     console.log(
-      'Pinged your deployment. You successfully connected to MongoDB!'
-    )
+      "Pinged your deployment. You successfully connected to MongoDB!"
+    );
   } finally {
     // Ensures that the client will close when you finish/error
   }
 }
-run().catch(console.dir)
+run().catch(console.dir);
 
 app.get("/", (req, res) => {
   res.send("Welcome to AssetVerse Server");
