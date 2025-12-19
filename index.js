@@ -54,11 +54,63 @@ async function run() {
 
     const usersCollection = db.collection("users");
     const assetsCollection = db.collection("assets");
-    const employeeAffiliationsCollection = db.collection("employeeAffiliations");
+    const employeeAffiliationsCollection = db.collection(
+      "employeeAffiliations"
+    );
     const requestsCollection = db.collection("requests");
     const assignedAssetsCollection = db.collection("assignedAssets");
     const packagesCollection = db.collection("packages");
     const paymentsCollection = db.collection("payments");
+
+    // save or update an user
+    app.post("/user", async (req, res) => {
+      const userData = req.body;
+      const query = { email: userData.email };
+      const existingUser = await usersCollection.findOne(query);
+
+      if (existingUser) {
+        await usersCollection.updateOne(query, {
+          $set: userData,
+          updatedAt: new Date(),
+        });
+        return res.send({ message: "User updated" });
+      }
+
+      userData.createdAt = new Date();
+      userData.updatedAt = new Date();
+      const result = await usersCollection.insertOne(userData);
+      res.send(result);
+    });
+
+    // Get user role
+    app.get("/user/role", verifyJWT, async (req, res) => {
+      const user = await usersCollection.findOne({ email: req.tokenEmail });
+      res.send({ role: user?.role, companyName: user?.companyName });
+    });
+
+    // Assets
+
+    // Add assets
+    app.post("/assets", verifyJWT, async (req, res) => {
+      const hr = await usersCollection.findOne({ email: req.tokenEmail });
+      if (!hr || hr.role !== "hr") return res.status(403).send({ message: "HR only" });
+
+      const { productName, productImage, productType, productQuantity } = req.body;
+      const asset = {
+        productName,
+        productImage,
+        productType,
+        productQuantity,
+        availableQuantity: productQuantity,
+        hrEmail: hr.email,
+        companyName: hr.companyName,
+        dateAdded: new Date(),
+      };
+      const result = await assetsCollection.insertOne(asset);
+      res.send(result);
+    });
+
+    
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
