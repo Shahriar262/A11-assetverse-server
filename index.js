@@ -222,6 +222,179 @@ async function run() {
       res.send({ message: "Request approved and assigned" });
     });
 
+    // HR rejects request
+    app.patch("/requests/:id/reject", verifyJWT, async (req, res) => {
+      const hr = await usersCollection.findOne({ email: req.tokenEmail });
+      if (!hr || hr.role !== "hr")
+        return res.status(403).send({ message: "HR only" });
+
+      const requestId = req.params.id;
+      await requestsCollection.updateOne(
+        { _id: new ObjectId(requestId) },
+        {
+          $set: {
+            requestStatus: "rejected",
+            approvalDate: new Date(),
+            processedBy: hr.email,
+          },
+        }
+      );
+
+      res.send({ message: "Request rejected" });
+    });
+
+    // Employee Dashboard
+
+    // Get assigned assets for employee
+    app.get("/my-assets", verifyJWT, async (req, res) => {
+      const assignedAssets = await assignedAssetsCollection
+        .find({ employeeEmail: req.tokenEmail })
+        .toArray();
+      res.send(assignedAssets);
+    });
+
+    // Employee returns an asset
+    app.post("/my-assets/:id/return", verifyJWT, async (req, res) => {
+      const assignedAssetId = req.params.id;
+      const asset = await assignedAssetsCollection.findOne({
+        _id: new ObjectId(assignedAssetId),
+      });
+      if (!asset)
+        return res.status(404).send({ message: "Assigned asset not found" });
+
+      await assignedAssetsCollection.updateOne(
+        { _id: asset._id },
+        { $set: { status: "returned", returnDate: new Date() } }
+      );
+      await assetsCollection.updateOne(
+        { _id: asset.assetId },
+        { $inc: { availableQuantity: 1 } }
+      );
+      res.send({ message: "Asset returned successfully" });
+    });
+
+    // Get employee's team
+    app.get("/my-team", verifyJWT, async (req, res) => {
+      const affiliations = await employeeAffiliationsCollection
+        .find({ employeeEmail: req.tokenEmail })
+        .toArray();
+      const employees = [];
+      for (const aff of affiliations) {
+        const team = await employeeAffiliationsCollection
+          .find({ companyName: aff.companyName, status: "active" })
+          .toArray();
+        employees.push(...team);
+      }
+      res.send(employees);
+    });
+
+    // Profile 
+    app.get("/profile", verifyJWT, async (req, res) => {
+      const user = await usersCollection.findOne({ email: req.tokenEmail });
+      res.send(user);
+    });
+
+    app.patch("/profile", verifyJWT, async (req, res) => {
+      const updateData = req.body;
+      updateData.updatedAt = new Date();
+      await usersCollection.updateOne(
+        { email: req.tokenEmail },
+        { $set: updateData }
+      );
+      res.send({ message: "Profile updated" });
+    });
+
+
+    // Get packages
+    app.get("/packages", async (req, res) => {
+      const packages = await packagesCollection.find().toArray();
+      res.send(packages);
+    });
+
+    // Upgrade package
+    app.post("/upgrade-package", verifyJWT, async (req, res) => {
+      const hr = await usersCollection.findOne({ email: req.tokenEmail });
+      if (!hr || hr.role !== "hr")
+        return res.status(403).send({ message: "HR only" });
+
+      const { packageId } = req.body;
+      const packageData = await packagesCollection.findOne({
+        _id: new ObjectId(packageId),
+      });
+      if (!packageData)
+        return res.status(404).send({ message: "Package not found" });
+
+      // Create Stripe Payment 
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ["card"],
+        mode: "payment",
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: { name: packageData.name },
+              unit_amount: packageData.price * 100,
+            },
+            quantity: 1,
+          },
+        ],
+        success_url: `${process.env.CLIENT_DOMAIN}/dashboard`,
+        cancel_url: `${process.env.CLIENT_DOMAIN}/dashboard`,
+        metadata: { hrEmail: hr.email, packageId: packageData._id.toString() },
+      });
+
+      res.send({ url: session.url });
+    });
+
+    // Stripe for payment success
+    app.post(
+      "/stripe-webhook",
+      express.raw({ type: "application/json" }),
+      async (req, res) => {
+        let event;
+        try {
+          event = stripe.webhooks.constructEvent(
+            req.body,
+            req.headers["stripe-signature"],
+            process.env.STRIPE_WEBHOOK_SECRET
+          );
+        } catch (err) {
+          return res.status(400).send(`Webhook Error: ${err.message}`);
+        }
+
+        if (event.type === "checkout.session.completed") {
+          const session = event.data.object;
+          const hrEmail = session.metadata.hrEmail;
+          const packageId = session.metadata.packageId;
+
+          const packageData = await packagesCollection.findOne({
+            _id: new ObjectId(packageId),
+          });
+          await usersCollection.updateOne(
+            { email: hrEmail },
+            {
+              $set: {
+                packageLimit: packageData.employeeLimit,
+                subscription: packageData.name,
+              },
+            }
+          );
+
+          await paymentsCollection.insertOne({
+            hrEmail,
+            packageName: packageData.name,
+            employeeLimit: packageData.employeeLimit,
+            amount: session.amount_total / 100,
+            transactionId: session.payment_intent,
+            paymentDate: new Date(),
+            status: "completed",
+          });
+        }
+
+        res.send({ received: true });
+      }
+    );
+
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
