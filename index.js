@@ -51,7 +51,14 @@ const client = new MongoClient(process.env.MONGODB_URI, {
 async function run() {
   try {
     const db = client.db("assetsDB");
+
+    const usersCollection = db.collection("users");
     const assetsCollection = db.collection("assets");
+    const employeeAffiliationsCollection = db.collection("employeeAffiliations");
+    const requestsCollection = db.collection("requests");
+    const assignedAssetsCollection = db.collection("assignedAssets");
+    const packagesCollection = db.collection("packages");
+    const paymentsCollection = db.collection("payments");
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
