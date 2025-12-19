@@ -93,9 +93,11 @@ async function run() {
     // Add assets
     app.post("/assets", verifyJWT, async (req, res) => {
       const hr = await usersCollection.findOne({ email: req.tokenEmail });
-      if (!hr || hr.role !== "hr") return res.status(403).send({ message: "HR only" });
+      if (!hr || hr.role !== "hr")
+        return res.status(403).send({ message: "HR only" });
 
-      const { productName, productImage, productType, productQuantity } = req.body;
+      const { productName, productImage, productType, productQuantity } =
+        req.body;
       const asset = {
         productName,
         productImage,
@@ -110,7 +112,115 @@ async function run() {
       res.send(result);
     });
 
-    
+    // Get all assets for HR's company
+    app.get("/assets", verifyJWT, async (req, res) => {
+      const hr = await usersCollection.findOne({ email: req.tokenEmail });
+      if (!hr) return res.status(403).send({ message: "unauthorized" });
+      const assets = await assetsCollection
+        .find({ companyName: hr.companyName })
+        .toArray();
+      res.send(assets);
+    });
+
+    // Get available assets for employees
+    app.get("/available-assets", verifyJWT, async (req, res) => {
+      const assets = await assetsCollection
+        .find({ availableQuantity: { $gt: 0 } })
+        .toArray();
+      res.send(assets);
+    });
+
+    // Employee requests an asset
+    app.post("/requests", verifyJWT, async (req, res) => {
+      const employee = await usersCollection.findOne({ email: req.tokenEmail });
+      if (!employee) return res.status(403).send({ message: "Unauthorized" });
+
+      const { assetId, note } = req.body;
+      const asset = await assetsCollection.findOne({
+        _id: new ObjectId(assetId),
+      });
+      if (!asset) return res.status(404).send({ message: "Asset not found" });
+
+      const request = {
+        assetId: asset._id,
+        assetName: asset.productName,
+        assetType: asset.productType,
+        requesterName: employee.name,
+        requesterEmail: employee.email,
+        hrEmail: asset.hrEmail,
+        companyName: asset.companyName,
+        requestDate: new Date(),
+        requestStatus: "pending",
+        note: note || "",
+      };
+      const result = await requestsCollection.insertOne(request);
+      res.send(result);
+    });
+
+    // HR approves request
+    app.patch("/requests/:id/approve", verifyJWT, async (req, res) => {
+      const hr = await usersCollection.findOne({ email: req.tokenEmail });
+      if (!hr || hr.role !== "hr")
+        return res.status(403).send({ message: "HR only" });
+
+      const requestId = req.params.id;
+      const request = await requestsCollection.findOne({
+        _id: new ObjectId(requestId),
+      });
+      if (!request)
+        return res.status(404).send({ message: "Request not found" });
+
+      // Update request status
+      await requestsCollection.updateOne(
+        { _id: request._id },
+        {
+          $set: {
+            requestStatus: "approved",
+            approvalDate: new Date(),
+            processedBy: hr.email,
+          },
+        }
+      );
+
+      // Update asset quantity
+      await assetsCollection.updateOne(
+        { _id: request.assetId },
+        { $inc: { availableQuantity: -1 } }
+      );
+
+      // Create assigned asset
+      await assignedAssetsCollection.insertOne({
+        assetId: request.assetId,
+        assetName: request.assetName,
+        assetImage: request.assetImage,
+        assetType: request.assetType,
+        employeeEmail: request.requesterEmail,
+        employeeName: request.requesterName,
+        hrEmail: hr.email,
+        companyName: hr.companyName,
+        assignmentDate: new Date(),
+        status: "assigned",
+      });
+
+      // Create affiliation if first time
+      const affiliationExists = await employeeAffiliationsCollection.findOne({
+        employeeEmail: request.requesterEmail,
+        companyName: hr.companyName,
+      });
+      if (!affiliationExists) {
+        await employeeAffiliationsCollection.insertOne({
+          employeeEmail: request.requesterEmail,
+          employeeName: request.requesterName,
+          hrEmail: hr.email,
+          companyName: hr.companyName,
+          companyLogo: hr.companyLogo,
+          affiliationDate: new Date(),
+          status: "active",
+        });
+      }
+
+      res.send({ message: "Request approved and assigned" });
+    });
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
