@@ -19,7 +19,7 @@ const app = express();
 // middleware
 app.use(
   cors({
-    origin: ["http://localhost:5173"],
+    origin: [process.env.CLIENT_DOMAIN, "http://localhost:5173"],
     credentials: true,
   })
 );
@@ -76,9 +76,8 @@ async function run() {
       next();
     };
 
-    
     // User & Profile Routes
-   
+
     app.post("/user", async (req, res) => {
       try {
         const userData = req.body;
@@ -191,10 +190,10 @@ async function run() {
     // GET /employee/companies
     app.get("/employee/companies", verifyJWT, async (req, res) => {
       try {
-        const employeeEmail = req.tokenEmail; 
+        const employeeEmail = req.tokenEmail;
 
         const affiliations = await employeeAffiliationsCollection
-          .find({ employeeEmail, status: "active" }) 
+          .find({ employeeEmail, status: "active" })
           .toArray();
 
         // Populate company info from HR / users collection
@@ -215,9 +214,8 @@ async function run() {
       }
     });
 
-    // -----------------------------
     // Assets Routes (HR)
-    // -----------------------------
+
     // Add Asset
     app.post("/assets", verifyJWT, verifyHR, async (req, res) => {
       try {
@@ -281,10 +279,8 @@ async function run() {
       }
     });
 
-    // -----------------------------
     // Employee Requests
-    // -----------------------------
-    // POST request creation
+
     // POST /requests
     app.post("/requests", verifyJWT, verifyEmployee, async (req, res) => {
       try {
@@ -324,9 +320,9 @@ async function run() {
         // 4. Create request object with correct asset fields
         const request = {
           assetId: asset._id,
-          assetName: asset.name, 
-          assetType: asset.type, 
-          assetImage: asset.productImage, 
+          assetName: asset.name,
+          assetType: asset.type,
+          assetImage: asset.productImage,
           requesterEmail: req.tokenEmail,
           requesterName: employee.name,
           hrEmail: asset.hrEmail,
@@ -349,9 +345,8 @@ async function run() {
       }
     });
 
-    
     // Get All Requests (HR)
-   
+
     app.get("/requests/all", verifyJWT, verifyHR, async (req, res) => {
       try {
         const hrEmail = req.tokenEmail;
@@ -658,9 +653,8 @@ async function run() {
       }
     );
 
-    
     // Packages & Payments
-    
+
     app.get("/packages", verifyJWT, async (req, res) => {
       try {
         const result = await packagesCollection.find().toArray();
@@ -749,23 +743,59 @@ async function run() {
       }
     });
 
-  
     // HR Employee List
-  
+
     app.get("/employees/my", verifyJWT, verifyHR, async (req, res) => {
       try {
         const hrEmail = req.tokenEmail;
+
         const employees = await employeeAffiliationsCollection
-          .find({ hrEmail, status: "active" })
+          .aggregate([
+            {
+              $match: {
+                hrEmail,
+                status: "active",
+              },
+            },
+            {
+              $lookup: {
+                from: "users",
+                localField: "employeeEmail",
+                foreignField: "email",
+                as: "employeeInfo",
+              },
+            },
+            { $unwind: "$employeeInfo" },
+            {
+              $lookup: {
+                from: "assignedAssets",
+                localField: "employeeEmail",
+                foreignField: "employeeEmail",
+                as: "assignedAssets",
+              },
+            },
+            {
+              $project: {
+                employeeEmail: 1,
+                employeeName: 1,
+                affiliationDate: 1,
+                profileImage: "$employeeInfo.profileImage",
+                assetsCount: { $size: "$assignedAssets" },
+              },
+            },
+          ])
           .toArray();
+
         const hr = await usersCollection.findOne({ email: hrEmail });
+
         res.send({
           employees,
           currentEmployees: hr?.currentEmployees || 0,
           packageLimit: hr?.packageLimit || 0,
         });
       } catch (err) {
-        res.status(500).send({ message: "Error fetching employees", err });
+        console.error(err);
+        res.status(500).send({ message: "Error fetching employees" });
       }
     });
 
