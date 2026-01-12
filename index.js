@@ -5,6 +5,8 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const admin = require("firebase-admin");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
+const ALLOWED_ASSET_TYPES = ["Returnable", "Non-returnable"];
+
 const port = process.env.PORT || 5000;
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
   "utf-8"
@@ -160,6 +162,35 @@ async function run() {
       }
     });
 
+    // POST /user/google
+    app.post("/user/google", async (req, res) => {
+      try {
+        const { name, email, photoURL } = req.body;
+
+        const existingUser = await usersCollection.findOne({ email });
+
+        if (existingUser) {
+          return res.send({ role: existingUser.role });
+        }
+
+        const newUser = {
+          name,
+          email,
+          profileImage: photoURL || "",
+          role: "employee", // ✅ DEFAULT ROLE
+          companyAffiliations: [],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        await usersCollection.insertOne(newUser);
+
+        res.send({ role: "employee" });
+      } catch (err) {
+        res.status(500).send({ message: "Google user save failed", err });
+      }
+    });
+
     app.patch("/user/update", verifyJWT, async (req, res) => {
       try {
         const updates = req.body;
@@ -231,6 +262,16 @@ async function run() {
           return res.status(400).send({ message: "Missing required fields" });
         }
 
+        // ✅ Validate type
+        const typeLower = productType.toLowerCase();
+        if (!ALLOWED_ASSET_TYPES.includes(typeLower)) {
+          return res.status(400).send({
+            message: `Invalid asset type. Allowed types: ${ALLOWED_ASSET_TYPES.join(
+              ", "
+            )}`,
+          });
+        }
+
         const qty = parseInt(quantity, 10);
         if (isNaN(qty) || qty <= 0) {
           return res.status(400).send({ message: "Invalid quantity" });
@@ -238,7 +279,7 @@ async function run() {
 
         const asset = {
           name: productName,
-          type: productType,
+          type: typeLower, // store lowercase
           quantity: qty,
           availableQuantity: qty,
           productImage: productImage || "",
@@ -267,6 +308,63 @@ async function run() {
         res.send(result);
       } catch (err) {
         res.status(500).send({ message: "Error fetching assets", err });
+      }
+    });
+
+    // 🌍 PUBLIC - Explore / All Assets
+    app.get("/public/assets", async (req, res) => {
+      try {
+        const { search = "", type, page = 1, limit = 8 } = req.query;
+
+        const query = {};
+
+        // Search filter
+        if (search) {
+          query.name = { $regex: search, $options: "i" };
+        }
+
+        // Type filter: DB te 'Returnable' / 'Non-returnable' ase
+        if (type) {
+          if (type === "returnable") query.type = "Returnable";
+          else if (type === "non-returnable") query.type = "Non-returnable";
+        }
+
+        // Pagination
+        const skip = (Number(page) - 1) * Number(limit);
+
+        const assets = await assetsCollection
+          .find(query)
+          .skip(skip)
+          .limit(Number(limit))
+          .toArray();
+
+        const total = await assetsCollection.countDocuments(query);
+
+        res.send({
+          assets,
+          total,
+          page: Number(page),
+          totalPages: Math.ceil(total / limit),
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Failed to load assets", err });
+      }
+    });
+
+    app.get("/public/assets/:id", async (req, res) => {
+      try {
+        const asset = await assetsCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+
+        if (!asset) {
+          return res.status(404).send({ message: "Asset not found" });
+        }
+
+        res.send(asset);
+      } catch (err) {
+        res.status(500).send({ message: "Failed to load asset" });
       }
     });
 
@@ -597,26 +695,55 @@ async function run() {
       }
     });
 
-    // -----------------------------
-    // Assigned Assets
-    // -----------------------------
-    app.get(
-      "/assigned-assets/my",
-      verifyJWT,
-      verifyEmployee,
-      async (req, res) => {
-        try {
-          const result = await assignedAssetsCollection
-            .find({ employeeEmail: req.tokenEmail })
-            .toArray();
-          res.send(result);
-        } catch (err) {
-          res
-            .status(500)
-            .send({ message: "Error fetching assigned assets", err });
-        }
+    // HR Dashboard overview stats
+    app.get("/dashboard/hr/overview", verifyJWT, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.tokenEmail;
+
+        // Total assets added by this HR
+        const totalAssets = await assetsCollection.countDocuments({ hrEmail });
+
+        // Available assets
+        const availableAssetsData = await assetsCollection
+          .aggregate([
+            { $match: { hrEmail, availableQuantity: { $gt: 0 } } },
+            { $count: "count" },
+          ])
+          .toArray();
+        const availableAssets = availableAssetsData[0]?.count || 0;
+
+        // Total employees
+        const hr = await usersCollection.findOne({ email: hrEmail });
+        const totalEmployees = hr?.currentEmployees || 0;
+
+        // Pending requests
+        const pendingRequests = await requestsCollection.countDocuments({
+          hrEmail,
+          requestStatus: "pending",
+        });
+
+        // Return array matching frontend card format
+        res.send([
+          { title: "Total Assets", value: totalAssets, color: "#6366f1" },
+          {
+            title: "Available Assets",
+            value: availableAssets,
+            color: "#22c55e",
+          },
+          { title: "Employees", value: totalEmployees, color: "#0ea5e9" },
+          {
+            title: "Pending Requests",
+            value: pendingRequests,
+            color: "#ef4444",
+          },
+        ]);
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Failed to fetch HR overview", err });
       }
-    );
+    });
+
+    // Assigned assets patch
 
     app.patch(
       "/assigned-assets/:id/return",
