@@ -9,7 +9,7 @@ const ALLOWED_ASSET_TYPES = ["Returnable", "Non-returnable"];
 
 const port = process.env.PORT || 5000;
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
-  "utf-8"
+  "utf-8",
 );
 const serviceAccount = JSON.parse(decoded);
 admin.initializeApp({
@@ -23,7 +23,7 @@ app.use(
   cors({
     origin: [process.env.CLIENT_DOMAIN, "http://localhost:5173"],
     credentials: true,
-  })
+  }),
 );
 app.use(express.json());
 
@@ -56,7 +56,7 @@ async function run() {
     const usersCollection = db.collection("users");
     const assetsCollection = db.collection("assets");
     const employeeAffiliationsCollection = db.collection(
-      "employeeAffiliations"
+      "employeeAffiliations",
     );
     const requestsCollection = db.collection("requests");
     const assignedAssetsCollection = db.collection("assignedAssets");
@@ -94,7 +94,7 @@ async function run() {
         if (existingUser) {
           const result = await usersCollection.updateOne(
             { email: userData.email },
-            { $set: { ...userData, updatedAt: new Date() } }
+            { $set: { ...userData, updatedAt: new Date() } },
           );
           return res.send(result);
         }
@@ -121,7 +121,7 @@ async function run() {
         if (existingUser) {
           const result = await usersCollection.updateOne(
             { email: userData.email },
-            { $set: { ...userData, updatedAt: new Date() } }
+            { $set: { ...userData, updatedAt: new Date() } },
           );
           return res.send(result);
         }
@@ -197,7 +197,7 @@ async function run() {
         updates.updatedAt = new Date();
         const result = await usersCollection.updateOne(
           { email: req.tokenEmail },
-          { $set: updates }
+          { $set: updates },
         );
         res.send(result);
       } catch (err) {
@@ -235,7 +235,7 @@ async function run() {
               companyName: hr?.companyName || "N/A",
               companyLogo: hr?.companyLogo || null,
             };
-          })
+          }),
         );
 
         res.send(companies);
@@ -267,7 +267,7 @@ async function run() {
         if (!ALLOWED_ASSET_TYPES.includes(typeLower)) {
           return res.status(400).send({
             message: `Invalid asset type. Allowed types: ${ALLOWED_ASSET_TYPES.join(
-              ", "
+              ", ",
             )}`,
           });
         }
@@ -475,7 +475,7 @@ async function run() {
         const hrEmail = req.tokenEmail;
         const hr = await usersCollection.findOne(
           { email: hrEmail },
-          { projection: { companyName: 1, name: 1, email: 1 } }
+          { projection: { companyName: 1, name: 1, email: 1 } },
         );
 
         if (!hr) return res.status(404).send({ message: "HR not found" });
@@ -540,86 +540,30 @@ async function run() {
             .status(500)
             .send({ message: "Failed to fetch assigned assets", err });
         }
-      }
+      },
     );
 
     app.patch(
-      "/requests/:id/approve",
+      "/asset-requests/:id/approve",
       verifyJWT,
       verifyHR,
       async (req, res) => {
-        try {
-          const requestId = req.params.id;
+        const requestId = req.params.id;
 
-          //  Validate request
+        try {
+          // Validate ObjectId
+          if (!ObjectId.isValid(requestId)) {
+            return res.status(400).send({ message: "Invalid request ID" });
+          }
+
+          // 1️⃣ Find the request
           const request = await requestsCollection.findOne({
             _id: new ObjectId(requestId),
           });
+          if (!request)
+            return res.status(404).send({ message: "Request not found" });
 
-          if (!request || request.requestStatus !== "pending") {
-            return res.status(400).send({ message: "Invalid request" });
-          }
-
-          //  Validate asset
-          const asset = await assetsCollection.findOne({
-            _id: new ObjectId(request.assetId),
-          });
-
-          if (!asset || asset.availableQuantity < 1) {
-            return res.status(400).send({ message: "Asset not available" });
-          }
-
-          //  Prevent duplicate assignment
-          const alreadyAssigned = await assignedAssetsCollection.findOne({
-            assetId: request.assetId,
-            employeeEmail: request.requesterEmail,
-            status: "assigned",
-          });
-
-          if (alreadyAssigned) {
-            return res.status(400).send({ message: "Asset already assigned" });
-          }
-
-          //  HR package limit check
-          const hr = await usersCollection.findOne({ email: request.hrEmail });
-          if (hr?.packageLimit && hr.currentEmployees >= hr.packageLimit) {
-            return res.status(403).send({
-              message: "Employee limit reached. Upgrade package.",
-            });
-          }
-
-          //  Reduce asset quantity
-          await assetsCollection.updateOne(
-            { _id: asset._id },
-            { $inc: { availableQuantity: -1 } }
-          );
-
-          //  Update request
-          await requestsCollection.updateOne(
-            { _id: new ObjectId(requestId) },
-            {
-              $set: {
-                requestStatus: "approved",
-                approvalDate: new Date(),
-                processedBy: req.tokenEmail,
-              },
-            }
-          );
-
-          //  Assign asset
-          await assignedAssetsCollection.insertOne({
-            assetId: request.assetId,
-            assetName: request.assetName,
-            assetType: request.assetType,
-            employeeEmail: request.requesterEmail,
-            employeeName: request.requesterName,
-            hrEmail: request.hrEmail,
-            companyName: request.companyName,
-            assignmentDate: new Date(),
-            status: "assigned",
-          });
-
-          // 8️⃣ Employee affiliation
+          // 2️⃣ Check existing affiliation
           const affiliationExists =
             await employeeAffiliationsCollection.findOne({
               employeeEmail: request.requesterEmail,
@@ -627,43 +571,70 @@ async function run() {
               status: "active",
             });
 
+          // 3️⃣ Fetch HR info
+          const hr = await usersCollection.findOne({ email: request.hrEmail });
+          if (!hr) return res.status(404).send({ message: "HR not found" });
+
+          const currentEmployees = hr.currentEmployees || 0;
+          const packageLimit = hr.packageLimit || 0;
+
+          // 4️⃣ Check package limit for new employee
+          if (
+            !affiliationExists &&
+            packageLimit > 0 &&
+            currentEmployees >= packageLimit
+          ) {
+            return res.status(403).send({
+              message: "Employee limit reached. Upgrade package.",
+              showUpgrade: true,
+            });
+          }
+
+          // 5️⃣ Update request status to approved
+          const updateResult = await requestsCollection.updateOne(
+            { _id: new ObjectId(requestId) },
+            { $set: { requestStatus: "approved", approvedAt: new Date() } },
+          );
+          if (updateResult.modifiedCount === 0) {
+            return res
+              .status(500)
+              .send({ message: "Failed to update request status" });
+          }
+
+          // 6️⃣ If new employee, create affiliation and increment HR employees
           if (!affiliationExists) {
-            await employeeAffiliationsCollection.insertOne({
+            const affiliation = {
               employeeEmail: request.requesterEmail,
               employeeName: request.requesterName,
               hrEmail: request.hrEmail,
-              companyName: request.companyName,
-              affiliationDate: new Date(),
+              companyName: request.companyName || "N/A",
               status: "active",
-            });
+              joinedAt: new Date(),
+            };
 
-            // Update employee profile (frontend profile fix)
-            await usersCollection.updateOne(
-              { email: request.requesterEmail },
-              {
-                $addToSet: {
-                  companyAffiliations: {
-                    companyName: request.companyName,
-                    approvedBy: request.hrEmail,
-                    approvedAt: new Date(),
-                  },
-                },
-              }
-            );
+            const insertAff =
+              await employeeAffiliationsCollection.insertOne(affiliation);
+            if (!insertAff.insertedId)
+              return res
+                .status(500)
+                .send({ message: "Failed to create affiliation" });
 
-            // Increase HR employee count
+            // Increment HR currentEmployees safely
             await usersCollection.updateOne(
               { email: request.hrEmail },
-              { $inc: { currentEmployees: 1 } }
+              { $inc: { currentEmployees: 1 } },
+              { upsert: true },
             );
           }
 
-          res.send({ message: "Request approved successfully" });
+          res.send({ message: "Asset request approved successfully" });
         } catch (err) {
-          console.error(err);
-          res.status(500).send({ message: "Approval failed", err });
+          console.error("Approval error:", err);
+          res
+            .status(500)
+            .send({ message: "Approval failed", error: err.message });
         }
-      }
+      },
     );
 
     app.patch("/requests/:id/reject", verifyJWT, verifyHR, async (req, res) => {
@@ -686,7 +657,7 @@ async function run() {
               approvalDate: new Date(),
               processedBy: req.tokenEmail,
             },
-          }
+          },
         );
 
         res.send({ message: "Request rejected" });
@@ -696,52 +667,52 @@ async function run() {
     });
 
     // HR Dashboard overview stats
-    app.get("/dashboard/hr/overview", verifyJWT, verifyHR, async (req, res) => {
-      try {
-        const hrEmail = req.tokenEmail;
+    // app.get("/dashboard/hr/overview", verifyJWT, verifyHR, async (req, res) => {
+    //   try {
+    //     const hrEmail = req.tokenEmail;
 
-        // Total assets added by this HR
-        const totalAssets = await assetsCollection.countDocuments({ hrEmail });
+    //     // Total assets added by this HR
+    //     const totalAssets = await assetsCollection.countDocuments({ hrEmail });
 
-        // Available assets
-        const availableAssetsData = await assetsCollection
-          .aggregate([
-            { $match: { hrEmail, availableQuantity: { $gt: 0 } } },
-            { $count: "count" },
-          ])
-          .toArray();
-        const availableAssets = availableAssetsData[0]?.count || 0;
+    //     // Available assets
+    //     const availableAssetsData = await assetsCollection
+    //       .aggregate([
+    //         { $match: { hrEmail, availableQuantity: { $gt: 0 } } },
+    //         { $count: "count" },
+    //       ])
+    //       .toArray();
+    //     const availableAssets = availableAssetsData[0]?.count || 0;
 
-        // Total employees
-        const hr = await usersCollection.findOne({ email: hrEmail });
-        const totalEmployees = hr?.currentEmployees || 0;
+    //     // Total employees
+    //     const hr = await usersCollection.findOne({ email: hrEmail });
+    //     const totalEmployees = hr?.currentEmployees || 0;
 
-        // Pending requests
-        const pendingRequests = await requestsCollection.countDocuments({
-          hrEmail,
-          requestStatus: "pending",
-        });
+    //     // Pending requests
+    //     const pendingRequests = await requestsCollection.countDocuments({
+    //       hrEmail,
+    //       requestStatus: "pending",
+    //     });
 
-        // Return array matching frontend card format
-        res.send([
-          { title: "Total Assets", value: totalAssets, color: "#6366f1" },
-          {
-            title: "Available Assets",
-            value: availableAssets,
-            color: "#22c55e",
-          },
-          { title: "Employees", value: totalEmployees, color: "#0ea5e9" },
-          {
-            title: "Pending Requests",
-            value: pendingRequests,
-            color: "#ef4444",
-          },
-        ]);
-      } catch (err) {
-        console.error(err);
-        res.status(500).send({ message: "Failed to fetch HR overview", err });
-      }
-    });
+    //     // Return array matching frontend card format
+    //     res.send([
+    //       { title: "Total Assets", value: totalAssets, color: "#6366f1" },
+    //       {
+    //         title: "Available Assets",
+    //         value: availableAssets,
+    //         color: "#22c55e",
+    //       },
+    //       { title: "Employees", value: totalEmployees, color: "#0ea5e9" },
+    //       {
+    //         title: "Pending Requests",
+    //         value: pendingRequests,
+    //         color: "#ef4444",
+    //       },
+    //     ]);
+    //   } catch (err) {
+    //     console.error(err);
+    //     res.status(500).send({ message: "Failed to fetch HR overview", err });
+    //   }
+    // });
 
     // Assigned assets patch
 
@@ -761,31 +732,34 @@ async function run() {
 
           await assignedAssetsCollection.updateOne(
             { _id: new ObjectId(assignedId) },
-            { $set: { status: "returned", returnDate: new Date() } }
+            { $set: { status: "returned", returnDate: new Date() } },
           );
           await assetsCollection.updateOne(
             { _id: new ObjectId(assignedAsset.assetId) },
-            { $inc: { availableQuantity: 1 } }
+            { $inc: { availableQuantity: 1 } },
           );
 
           await requestsCollection.updateOne(
             { assetId: assignedAsset.assetId, requesterEmail: req.tokenEmail },
-            { $set: { requestStatus: "returned", approvalDate: new Date() } }
+            { $set: { requestStatus: "returned", approvalDate: new Date() } },
           );
 
           res.send({ message: "Asset returned successfully" });
         } catch (err) {
           res.status(500).send({ message: "Return failed", err });
         }
-      }
+      },
     );
 
     // Packages & Payments
 
     app.get("/packages", verifyJWT, async (req, res) => {
       try {
-        const result = await packagesCollection.find().toArray();
-        res.send(result);
+        const packages = await packagesCollection.find().toArray();
+        if (!packages || packages.length === 0) {
+          return res.send({ message: "No packages available", packages: [] });
+        }
+        res.send(packages);
       } catch (err) {
         res.status(500).send({ message: "Error fetching packages", err });
       }
@@ -826,18 +800,28 @@ async function run() {
         } catch (err) {
           res.status(500).send({ message: "Checkout session failed", err });
         }
-      }
+      },
     );
 
     app.post("/payment-success", verifyJWT, verifyHR, async (req, res) => {
       try {
         const { sessionId, packageId } = req.body;
+
         const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (session.payment_status !== "paid") {
+          return res.status(400).send({ message: "Payment not completed" });
+        }
+
         const pkg = await packagesCollection.findOne({
           _id: new ObjectId(packageId),
         });
-        if (!pkg) return res.status(404).send({ message: "Package not found" });
 
+        if (!pkg) {
+          return res.status(404).send({ message: "Package not found" });
+        }
+
+        // save payment
         await paymentsCollection.insertOne({
           hrEmail: req.tokenEmail,
           packageName: pkg.name,
@@ -848,12 +832,13 @@ async function run() {
           status: "completed",
         });
 
+        // 🔥 UPDATE HR LIMIT
         await usersCollection.updateOne(
           { email: req.tokenEmail },
-          { $set: { packageLimit: pkg.employeeLimit } }
+          { $set: { packageLimit: pkg.employeeLimit } },
         );
 
-        res.send({ message: "Payment successful" });
+        res.send({ message: "Package upgraded successfully" });
       } catch (err) {
         res.status(500).send({ message: "Payment processing failed", err });
       }
@@ -936,12 +921,12 @@ async function run() {
 
           await employeeAffiliationsCollection.updateOne(
             { employeeEmail, hrEmail: req.tokenEmail },
-            { $set: { status: "inactive" } }
+            { $set: { status: "inactive" } },
           );
 
           await usersCollection.updateOne(
             { email: req.tokenEmail },
-            { $inc: { currentEmployees: -1 } }
+            { $inc: { currentEmployees: -1 } },
           );
 
           await usersCollection.updateOne(
@@ -952,20 +937,20 @@ async function run() {
                   approvedBy: req.tokenEmail,
                 },
               },
-            }
+            },
           );
 
           res.send({ message: "Employee removed from team" });
         } catch (err) {
           res.status(500).send({ message: "Failed to remove employee", err });
         }
-      }
+      },
     );
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
+      "Pinged your deployment. You successfully connected to MongoDB!",
     );
   } finally {
     // Ensures that the client will close when you finish/error
