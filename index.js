@@ -162,31 +162,79 @@ async function run() {
       }
     });
 
-    // POST /user/google
+    // Check if Google user exists (add BEFORE /user/google)
+    app.post("/user/google-check", async (req, res) => {
+      try {
+        const { email } = req.body;
+        const existingUser = await usersCollection.findOne({ email });
+        res.send({ exists: !!existingUser });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Check failed", err });
+      }
+    });
+
+    // Google signup route (replace existing /user/google)
     app.post("/user/google", async (req, res) => {
       try {
-        const { name, email, photoURL } = req.body;
+        const { name, email, photoURL, role } = req.body;
+
+        if (!["employee", "hr"].includes(role)) {
+          return res.status(400).send({
+            message: "Invalid role. Must be 'employee' or 'hr'",
+          });
+        }
 
         const existingUser = await usersCollection.findOne({ email });
 
         if (existingUser) {
-          return res.send({ role: existingUser.role });
+          return res.send({
+            role: existingUser.role,
+            message: "User already exists",
+          });
         }
 
-        const newUser = {
-          name,
-          email,
-          profileImage: photoURL || "",
-          role: "employee", // ✅ DEFAULT ROLE
-          companyAffiliations: [],
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-
-        await usersCollection.insertOne(newUser);
-
-        res.send({ role: "employee" });
+        if (role === "hr") {
+          const newHRUser = {
+            name,
+            email,
+            profileImage: photoURL || "",
+            role: "hr",
+            companyName: "",
+            companyLogo: "",
+            packageLimit: 5,
+            currentEmployees: 0,
+            subscription: "basic",
+            dateOfBirth: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          await usersCollection.insertOne(newHRUser);
+          return res.send({
+            role: "hr",
+            isNewUser: true,
+            message: "HR account created successfully",
+          });
+        } else {
+          const newEmployeeUser = {
+            name,
+            email,
+            profileImage: photoURL || "",
+            role: "employee",
+            dateOfBirth: null,
+            companyAffiliations: [],
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          await usersCollection.insertOne(newEmployeeUser);
+          return res.send({
+            role: "employee",
+            isNewUser: true,
+            message: "Employee account created successfully",
+          });
+        }
       } catch (err) {
+        console.error("Google user save failed:", err);
         res.status(500).send({ message: "Google user save failed", err });
       }
     });
@@ -377,6 +425,94 @@ async function run() {
       }
     });
 
+    // PATCH /assets/:id - HR updates own asset safely
+    app.patch("/assets/:id", verifyJWT, verifyHR, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { name, productType, productImage, quantity } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid asset ID" });
+        }
+
+        // Allowed types (keep consistent with frontend)
+        const allowedTypes = ["Returnable", "Non-returnable"];
+
+        if (!allowedTypes.includes(productType)) {
+          return res.status(400).send({
+            message: "Invalid asset type",
+          });
+        }
+
+        const newQuantity = parseInt(quantity);
+
+        if (isNaN(newQuantity) || newQuantity < 0) {
+          return res.status(400).send({
+            message: "Quantity must be a valid positive number",
+          });
+        }
+
+        // Find asset and ensure HR owns it
+        const asset = await assetsCollection.findOne({
+          _id: new ObjectId(id),
+          hrEmail: req.tokenEmail,
+        });
+
+        if (!asset) {
+          return res.status(404).send({
+            message: "Asset not found or unauthorized",
+          });
+        }
+
+        const oldQuantity = asset.quantity || 0;
+        const oldAvailable = asset.availableQuantity || 0;
+
+        // Calculate how many are already assigned
+        const assignedCount = oldQuantity - oldAvailable;
+
+        // Prevent reducing quantity below assigned amount
+        if (newQuantity < assignedCount) {
+          return res.status(400).send({
+            message: `Cannot reduce quantity below assigned assets (${assignedCount})`,
+          });
+        }
+
+        // Calculate quantity difference
+        const quantityDiff = newQuantity - oldQuantity;
+
+        const updateDoc = {
+          $set: {
+            name,
+            type: productType,
+            productImage,
+            quantity: newQuantity,
+            availableQuantity: oldAvailable + quantityDiff,
+            updatedAt: new Date(),
+          },
+        };
+
+        const result = await assetsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          updateDoc,
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(400).send({
+            message: "No changes made",
+          });
+        }
+
+        res.send({
+          message: "Asset updated successfully",
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({
+          message: "Asset update failed",
+        });
+      }
+    });
+
     // Employee Requests
 
     // POST /requests
@@ -440,6 +576,159 @@ async function run() {
       } catch (err) {
         console.error(err);
         res.status(500).send({ message: "Request creation failed", err });
+      }
+    });
+
+    // Overview stats
+    app.get("/dashboard/hr/overview", verifyJWT, verifyHR, async (req, res) => {
+      try {
+        const hrEmail = req.tokenEmail;
+        const [totalAssets, totalRequests, pendingRequests, approvedRequests] =
+          await Promise.all([
+            assetsCollection.countDocuments({ hrEmail }),
+            requestsCollection.countDocuments({ hrEmail }),
+            requestsCollection.countDocuments({
+              hrEmail,
+              requestStatus: "pending",
+            }),
+            requestsCollection.countDocuments({
+              hrEmail,
+              requestStatus: "approved",
+            }),
+          ]);
+        res.send({
+          totalAssets,
+          totalRequests,
+          pendingRequests,
+          approvedRequests,
+        });
+      } catch (err) {
+        res.status(500).send({ message: "Failed to fetch HR overview", err });
+      }
+    });
+
+    // Asset type distribution
+    app.get(
+      "/dashboard/hr/asset-types",
+      verifyJWT,
+      verifyHR,
+      async (req, res) => {
+        try {
+          const hrEmail = req.tokenEmail;
+          const pipeline = [
+            { $match: { hrEmail } },
+            { $group: { _id: "$type", count: { $sum: 1 } } },
+          ];
+          const result = await assetsCollection.aggregate(pipeline).toArray();
+          const typeCounts = { Returnable: 0, "Non-returnable": 0 };
+          result.forEach((r) => {
+            if (r._id.toLowerCase() === "returnable")
+              typeCounts.Returnable = r.count;
+            if (r._id.toLowerCase() === "non-returnable")
+              typeCounts["Non-returnable"] = r.count;
+          });
+          res.send(typeCounts);
+        } catch (err) {
+          res.status(500).send({ message: "Failed to fetch asset types", err });
+        }
+      },
+    );
+
+    // Request trends (all requests, no filter)
+    app.get(
+      "/dashboard/hr/request-trends",
+      verifyJWT,
+      verifyHR,
+      async (req, res) => {
+        try {
+          const hrEmail = req.tokenEmail;
+          const pipeline = [
+            { $match: { hrEmail } },
+            {
+              $group: {
+                _id: {
+                  $dateToString: { format: "%Y-%m", date: "$requestDate" },
+                },
+                value: { $sum: 1 },
+              },
+            },
+            { $sort: { _id: 1 } },
+          ];
+          const result = await requestsCollection.aggregate(pipeline).toArray();
+          const trends = result.map((r) => ({ label: r._id, value: r.value }));
+          res.send(trends);
+        } catch (err) {
+          res
+            .status(500)
+            .send({ message: "Failed to fetch request trends", err });
+        }
+      },
+    );
+
+    // POST /assign-asset
+    app.post("/assign-asset", verifyJWT, verifyHR, async (req, res) => {
+      try {
+        const { employeeEmail, assetId, note } = req.body;
+        const hrEmail = req.tokenEmail;
+
+        if (!employeeEmail || !assetId)
+          return res
+            .status(400)
+            .send({ message: "Employee and asset required" });
+
+        const asset = await assetsCollection.findOne({
+          _id: new ObjectId(assetId),
+          hrEmail,
+        });
+        if (!asset) return res.status(404).send({ message: "Asset not found" });
+        if (asset.availableQuantity < 1)
+          return res.status(400).send({ message: "Asset not available" });
+
+        const employee = await usersCollection.findOne({
+          email: employeeEmail,
+        });
+        if (!employee)
+          return res.status(404).send({ message: "Employee not found" });
+
+        const assignmentRequest = {
+          assetId: asset._id,
+          assetName: asset.name,
+          assetType: asset.type,
+          requesterEmail: employeeEmail,
+          requesterName: employee.name,
+          hrEmail,
+          companyName: asset.companyName || "N/A",
+          requestDate: new Date(),
+          requestStatus: "approved",
+          approvedAt: new Date(),
+          approvedBy: hrEmail,
+          note: note || "",
+          assignedDirectly: true,
+        };
+
+        const requestResult =
+          await requestsCollection.insertOne(assignmentRequest);
+        await assignedAssetsCollection.insertOne({
+          assetId: asset._id,
+          employeeEmail,
+          employeeName: employee.name,
+          hrEmail,
+          assetName: asset.name,
+          assetType: asset.type,
+          assignmentDate: new Date(),
+          status: "assigned",
+          requestId: requestResult.insertedId,
+        });
+
+        await assetsCollection.updateOne(
+          { _id: asset._id },
+          { $inc: { availableQuantity: -1 } },
+        );
+
+        res.send({ message: "Asset assigned successfully" });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Assignment failed", err });
       }
     });
 
@@ -637,6 +926,122 @@ async function run() {
       },
     );
 
+    // Employee Dashboard Analytics Endpoints
+
+    app.get(
+      "/dashboard/employee/overview",
+      verifyJWT,
+      verifyEmployee,
+      async (req, res) => {
+        try {
+          const email = req.tokenEmail;
+          const [
+            assignedAssets,
+            pendingRequests,
+            approvedRequests,
+            returnedAssets,
+          ] = await Promise.all([
+            assignedAssetsCollection.countDocuments({
+              employeeEmail: email,
+              status: "assigned",
+            }),
+            requestsCollection.countDocuments({
+              requesterEmail: email,
+              requestStatus: "pending",
+            }),
+            requestsCollection.countDocuments({
+              requesterEmail: email,
+              requestStatus: "approved",
+            }),
+            assignedAssetsCollection.countDocuments({
+              employeeEmail: email,
+              status: "returned",
+            }),
+          ]);
+          res.send({
+            assignedAssets,
+            pendingRequests,
+            approvedRequests,
+            returnedAssets,
+          });
+        } catch (err) {
+          res
+            .status(500)
+            .send({ message: "Failed to fetch employee overview", err });
+        }
+      },
+    );
+
+    app.get(
+      "/dashboard/employee/asset-types",
+      verifyJWT,
+      verifyEmployee,
+      async (req, res) => {
+        try {
+          const email = req.tokenEmail;
+          const pipeline = [
+            { $match: { employeeEmail: email, status: "assigned" } },
+            {
+              $lookup: {
+                from: "assets",
+                localField: "assetId",
+                foreignField: "_id",
+                as: "assetInfo",
+              },
+            },
+            { $unwind: "$assetInfo" },
+            { $group: { _id: "$assetInfo.type", count: { $sum: 1 } } },
+          ];
+          const result = await assignedAssetsCollection
+            .aggregate(pipeline)
+            .toArray();
+          const typeCounts = { Returnable: 0, "Non-returnable": 0 };
+          result.forEach((r) => {
+            if (r._id.toLowerCase() === "returnable")
+              typeCounts.Returnable = r.count;
+            if (r._id.toLowerCase() === "non-returnable")
+              typeCounts["Non-returnable"] = r.count;
+          });
+          res.send(typeCounts);
+        } catch (err) {
+          res.status(500).send({ message: "Failed to fetch asset types", err });
+        }
+      },
+    );
+
+    app.get(
+      "/dashboard/employee/request-trends",
+      verifyJWT,
+      verifyEmployee,
+      async (req, res) => {
+        try {
+          const email = req.tokenEmail;
+          const pipeline = [
+            { $match: { requesterEmail: email } },
+            {
+              $group: {
+                _id: {
+                  $dateToString: { format: "%Y-%m", date: "$requestDate" },
+                },
+                value: { $sum: 1 },
+              },
+            },
+            { $sort: { _id: 1 } },
+          ];
+          const result = await requestsCollection.aggregate(pipeline).toArray();
+          const trends = result.map((r) => ({
+            label: r._id,
+            value: r.value,
+          }));
+          res.send(trends);
+        } catch (err) {
+          res
+            .status(500)
+            .send({ message: "Failed to fetch request trends", err });
+        }
+      },
+    );
+
     app.patch("/requests/:id/reject", verifyJWT, verifyHR, async (req, res) => {
       try {
         const requestId = req.params.id;
@@ -665,54 +1070,6 @@ async function run() {
         res.status(500).send({ message: "Rejection failed", err });
       }
     });
-
-    // HR Dashboard overview stats
-    // app.get("/dashboard/hr/overview", verifyJWT, verifyHR, async (req, res) => {
-    //   try {
-    //     const hrEmail = req.tokenEmail;
-
-    //     // Total assets added by this HR
-    //     const totalAssets = await assetsCollection.countDocuments({ hrEmail });
-
-    //     // Available assets
-    //     const availableAssetsData = await assetsCollection
-    //       .aggregate([
-    //         { $match: { hrEmail, availableQuantity: { $gt: 0 } } },
-    //         { $count: "count" },
-    //       ])
-    //       .toArray();
-    //     const availableAssets = availableAssetsData[0]?.count || 0;
-
-    //     // Total employees
-    //     const hr = await usersCollection.findOne({ email: hrEmail });
-    //     const totalEmployees = hr?.currentEmployees || 0;
-
-    //     // Pending requests
-    //     const pendingRequests = await requestsCollection.countDocuments({
-    //       hrEmail,
-    //       requestStatus: "pending",
-    //     });
-
-    //     // Return array matching frontend card format
-    //     res.send([
-    //       { title: "Total Assets", value: totalAssets, color: "#6366f1" },
-    //       {
-    //         title: "Available Assets",
-    //         value: availableAssets,
-    //         color: "#22c55e",
-    //       },
-    //       { title: "Employees", value: totalEmployees, color: "#0ea5e9" },
-    //       {
-    //         title: "Pending Requests",
-    //         value: pendingRequests,
-    //         color: "#ef4444",
-    //       },
-    //     ]);
-    //   } catch (err) {
-    //     console.error(err);
-    //     res.status(500).send({ message: "Failed to fetch HR overview", err });
-    //   }
-    // });
 
     // Assigned assets patch
 
@@ -792,8 +1149,8 @@ async function run() {
             ],
             mode: "payment",
             customer_email: req.tokenEmail,
-            success_url: `${process.env.CLIENT_DOMAIN}/payment-success`,
-            cancel_url: `${process.env.CLIENT_DOMAIN}/packages`,
+            success_url: `${process.env.CLIENT_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}&packageId=${packageId}`,
+            cancel_url: `${process.env.CLIENT_DOMAIN}/dashboard/upgrade-package`,
           });
 
           res.send({ url: session.url });
